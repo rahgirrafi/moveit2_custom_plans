@@ -38,3 +38,7 @@ repositories:
     type: git
     url: https://github.com/moveit/moveit_msgs
     version: humble
+  vision_3D:
+    type: git
+    url: https://github.com/rahgirrafi/moveit2_vision_3D.git
+    version: main
