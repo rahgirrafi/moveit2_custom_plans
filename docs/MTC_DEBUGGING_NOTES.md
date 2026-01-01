@@ -264,7 +264,143 @@ current → Become Vertical → open hand → [Connect] → SerialContainer
 ## Files Modified
 
 - `/home/rafilappy/ws_moveit_forked/src/custom_plan/src/plan_node.cpp`
+- `/home/rafilappy/ws_moveit_forked/src/ros2_kortex/kortex_moveit_config/kinova_gen3_7dof_robotiq_2f_85_moveit_config/config/gen3.srdf`
 
 ## Date
 
 January 1, 2026
+
+---
+
+## Issue 7: Joint Values at Exact Limits Cause "Out of Bounds" Error
+
+### Symptom
+
+```
+close hand for push (0/1): Start state is out of bounds!
+```
+
+The stage receives 1 solution but produces 0 valid outputs.
+
+### Root Cause
+
+The gripper joint values in the SRDF were set to **exactly** the joint limits:
+
+| State | SRDF Value | URDF Limit   |
+| ----- | ---------- | ------------ |
+| Open  | `0.0`      | lower: `0.0` |
+| Close | `0.8`      | upper: `0.8` |
+
+Due to floating-point precision in trajectory interpolation (e.g., via `JointInterpolationPlanner`), the computed joint values can slightly exceed the exact limit (e.g., `0.800001`), causing MoveIt to reject the state as "out of bounds".
+
+### Fix
+
+Adjust SRDF values to be **slightly inside** the joint limits:
+
+**Before:**
+
+```xml
+<group_state name="Open" group="gripper">
+    <joint name="robotiq_85_left_knuckle_joint" value="0"/>
+</group_state>
+<group_state name="Close" group="gripper">
+    <joint name="robotiq_85_left_knuckle_joint" value="0.8"/>
+</group_state>
+```
+
+**After:**
+
+```xml
+<group_state name="Open" group="gripper">
+    <joint name="robotiq_85_left_knuckle_joint" value="0.001"/>
+</group_state>
+<group_state name="Close" group="gripper">
+    <joint name="robotiq_85_left_knuckle_joint" value="0.79"/>
+</group_state>
+```
+
+### Key Takeaway
+
+Always set SRDF joint values **slightly inside** the URDF limits (by ~0.01 rad or 1%) to avoid floating-point precision issues.
+
+---
+
+## How to Interpret MTC Output
+
+### Output Format
+
+```
+   X  - ←  Y →   -  Z / stage_name
+```
+
+| Column  | Meaning                                                           |
+| ------- | ----------------------------------------------------------------- |
+| `X`     | Solutions received from **previous** stage (backward propagation) |
+| `Y`     | Solutions **available** at this stage                             |
+| `Z`     | Solutions sent to **next** stage (forward propagation)            |
+| `←` `→` | Propagation direction arrows                                      |
+| `-`     | Not applicable for this direction                                 |
+
+### Example Analysis
+
+```
+1  - ←   1 →   -  0 / current                 ✅ 1 solution (start state)
+-  0 →   1 →   -  0 / Become Vertical         ✅ Received 1, produced 1
+-  0 →   0 →   -  0 / close hand for push     ❌ Received 1, produced 0 - FAILED!
+-  0 →   0 ←   2  - / move to button          ⏸️ Waiting (2 solutions from backward)
+2  - ←   2 →   -  2 / push button             ✅ Container generated 2 solutions
+```
+
+### Stage Types
+
+| Stage Type     | Example                                         | Behavior                                 |
+| -------------- | ----------------------------------------------- | ---------------------------------------- |
+| **Generator**  | `CurrentState`, `GenerateGraspPose`             | Creates solutions, propagates both ways  |
+| **Propagator** | `MoveTo`, `MoveRelative`, `ModifyPlanningScene` | Receives from one side, outputs to other |
+| **Connector**  | `Connect`                                       | Plans paths between two endpoints        |
+
+### Common Error Messages
+
+| Error                          | Cause                             | Fix                                         |
+| ------------------------------ | --------------------------------- | ------------------------------------------- |
+| `Start state is out of bounds` | Joint at/beyond URDF limit        | Adjust SRDF values inside limits            |
+| `X.XXXXX no IK found`          | `setMinSolutionDistance` too high | Reduce to 0.1 or less                       |
+| `min_fraction not met`         | Cartesian path failed             | Increase distance or use sampling planner   |
+| `Invalid goal state`           | Goal pose in collision            | Increase distance, check collision settings |
+| `Deviation in joint X`         | Gripper state mismatch at Connect | Add gripper motion stage before Connect     |
+
+---
+
+## Octomap Save/Load Utility
+
+A utility node was created to save and load octomaps for later use.
+
+### Files Added
+
+- `/home/rafilappy/ws_moveit_forked/src/custom_plan/src/octomap_saver.cpp`
+- `/home/rafilappy/ws_moveit_forked/src/custom_plan/launch/octomap_saver.launch.py`
+
+### Usage
+
+```bash
+# Run the node
+ros2 launch custom_plan octomap_saver.launch.py
+
+# Save current octomap
+ros2 service call /octomap_saver/save_octomap std_srvs/srv/Trigger
+
+# Load saved octomap
+ros2 service call /octomap_saver/load_octomap std_srvs/srv/Trigger
+
+# Clear octomap
+ros2 service call /octomap_saver/clear_octomap std_srvs/srv/Trigger
+```
+
+### Parameters
+
+| Parameter          | Default                | Description                     |
+| ------------------ | ---------------------- | ------------------------------- |
+| `save_directory`   | `/tmp/moveit_octomaps` | Directory to save/load octomaps |
+| `default_filename` | `octomap`              | Base filename for saved files   |
+
+Saved files use `.bt` format (octomap binary) and can be viewed with `octovis`.

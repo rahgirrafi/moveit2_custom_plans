@@ -82,6 +82,12 @@ void MTCTaskNode::setupPlanningScene()
 
   moveit::planning_interface::PlanningSceneInterface psi;
   psi.applyCollisionObject(object);
+  
+  RCLCPP_INFO(LOGGER, "Added collision object to planning scene");
+  
+  // NOTE: Octomap collision allowances should be added to the SRDF file directly
+  // Publishing an ACM via /planning_scene REPLACES the entire ACM, which would 
+  // remove all the disable_collisions entries from the SRDF
 }
 
 void MTCTaskNode::doTask()
@@ -206,7 +212,8 @@ mtc::Task MTCTaskNode::createTask()
                                           { "eef", "group", "ik_frame" });
    
     // Stage 1: Generate push pose + Compute IK (GENERATOR - central stage)
-    // The Connect stage before the container handles the approach motion
+    // This generates the "approach start" position - farther from the button
+    // All Cartesian motions will be AFTER this stage (forward propagating)
     {
       auto stage = std::make_unique<mtc::stages::GenerateGraspPose>("generate push pose");
       stage->properties().configureInitFrom(mtc::Stage::PARENT);
@@ -216,25 +223,24 @@ mtc::Task MTCTaskNode::createTask()
       stage->setAngleDelta(M_PI / 12);
       stage->setMonitoredStage(current_state_ptr);
       
-      // Transform: end-effector positioned before the button (pre-push position)
-      // IMPORTANT: This must be far enough to avoid collision with the object
-      // The Connect stage does NOT ignore collisions, so the goal must be collision-free
+      // Transform: end-effector positioned at approach start (farther from button)
+      // This is where Cartesian motion begins - must be collision-free
       Eigen::Isometry3d push_frame_transform = Eigen::Isometry3d::Identity();
-      push_frame_transform.translation().z() = 0.20;  // 20cm before button (increased from 10cm)
+      push_frame_transform.translation().z() = 0.25;  // 25cm before button (approach start)
 
-      // Compute IK - don't ignore collisions since Connect stage checks them
+      // Compute IK - ensure collision-free poses for Connect stage
       auto wrapper =
           std::make_unique<mtc::stages::ComputeIK>("push pose IK", std::move(stage));
       wrapper->setMaxIKSolutions(32);
       wrapper->setMinSolutionDistance(0.1);
-      wrapper->setIgnoreCollisions(false);  // Changed to false - ensure collision-free poses
+      wrapper->setIgnoreCollisions(false);
       wrapper->setIKFrame(push_frame_transform, hand_frame);
       wrapper->properties().configureInitFrom(mtc::Stage::PARENT, { "eef", "group" });
       wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, { "target_pose" });
       push_container->insert(std::move(wrapper));
     }
 
-    // Stage 2: Allow collision between gripper and button
+    // Stage 2: Allow collision between gripper and button (before approach)
     {
       auto stage =
           std::make_unique<mtc::stages::ModifyPlanningScene>("allow collision (hand,object)");
@@ -246,13 +252,31 @@ mtc::Task MTCTaskNode::createTask()
       push_container->insert(std::move(stage));
     }
 
-    // Stage 3: PUSH - Move forward to press the button
-    // From 20cm away, push forward to make contact with button
+    // Stage 3: APPROACH - Cartesian motion toward the button (straight line)
+    // Move from 25cm to ~5cm before the button
+    {
+      auto stage =
+          std::make_unique<mtc::stages::MoveRelative>("approach", cartesian_planner);
+      stage->properties().configureInitFrom(mtc::Stage::PARENT, { "group" });
+      stage->setMinMaxDistance(0.15, 0.20);  // Approach distance: 15-20cm
+      stage->setIKFrame(hand_frame);
+      stage->properties().set("marker_ns", "approach");
+
+      // Approach along positive Z (toward button) - straight line Cartesian motion
+      geometry_msgs::msg::Vector3Stamped vec;
+      vec.header.frame_id = hand_frame;
+      vec.vector.z = 1.0;
+      stage->setDirection(vec);
+      push_container->insert(std::move(stage));
+    }
+
+    // Stage 4: PUSH - Continue Cartesian motion to press the button
+    // Move from ~5cm to contact with button
     {
       auto stage =
           std::make_unique<mtc::stages::MoveRelative>("push", cartesian_planner);
       stage->properties().configureInitFrom(mtc::Stage::PARENT, { "group" });
-      stage->setMinMaxDistance(0.18, 0.22);  // Push distance: 18-22cm (to reach the button from 20cm away)
+      stage->setMinMaxDistance(0.02, 0.05);  // Push distance: 2-5cm (button is small)
       stage->setIKFrame(hand_frame);
       stage->properties().set("marker_ns", "push");
 
@@ -264,12 +288,12 @@ mtc::Task MTCTaskNode::createTask()
       push_container->insert(std::move(stage));
     }
 
-    // Stage 4: RETRACT - Move backward after pressing
+    // Stage 5: RETRACT - Cartesian motion backward after pressing
     {
       auto stage =
-          std::make_unique<mtc::stages::MoveRelative>("retract", cartesian_planner);
+          std::make_unique<mtc::stages::MoveRelative>("Return to Verti", cartesian_planner);
       stage->properties().configureInitFrom(mtc::Stage::PARENT, { "group" });
-      stage->setMinMaxDistance(0.15, 0.25);  // Retract distance: 15-25cm (back to safe position)
+      stage->setMinMaxDistance(0.20, 0.30);  // Retract distance: 20-30cm (back to safe position)
       stage->setIKFrame(hand_frame);
       stage->properties().set("marker_ns", "retract");
 
@@ -282,7 +306,6 @@ mtc::Task MTCTaskNode::createTask()
     }
 
     // Note: We don't re-enable collision checking since the task ends here
-    // If you need to continue with more stages, increase retract distance first
 
     task.add(std::move(push_container));
   }
