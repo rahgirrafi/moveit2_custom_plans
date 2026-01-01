@@ -4,6 +4,8 @@
 #include <moveit/task_constructor/task.h>
 #include <moveit/task_constructor/solvers.h>
 #include <moveit/task_constructor/stages.h>
+#include <tf2_ros/static_transform_broadcaster.h>
+#include <atomic>
 #if __has_include(<tf2_geometry_msgs/tf2_geometry_msgs.hpp>)
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #else
@@ -28,15 +30,20 @@ public:
   geometry_msgs::msg::PoseStamped last_centroid_;
   void centroidCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
   
+  // Flag to indicate new pose received (public for main loop access)
+  std::atomic<bool> new_pose_received_{false};
 
 private:
   mtc::Task createTask();
   mtc::Task task_;
   rclcpp::Node::SharedPtr node_;
   
-  // One-shot centroid subscriber
+  // Centroid subscriber
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr centroid_sub_;
-  void subscribeToCentroidOnce();
+  void subscribeToCentroid();
+  
+  // TF broadcaster for object frame visualization
+  std::shared_ptr<tf2_ros::StaticTransformBroadcaster> tf_broadcaster_;
 };
 
 rclcpp::node_interfaces::NodeBaseInterface::SharedPtr MTCTaskNode::getNodeBaseInterface()
@@ -47,10 +54,11 @@ rclcpp::node_interfaces::NodeBaseInterface::SharedPtr MTCTaskNode::getNodeBaseIn
 MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
   : node_{ std::make_shared<rclcpp::Node>("mtc_custom_node", options) }
 {
-   subscribeToCentroidOnce();
+   tf_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(node_);
+   subscribeToCentroid();
 }
 
-void MTCTaskNode::subscribeToCentroidOnce() {
+void MTCTaskNode::subscribeToCentroid() {
   centroid_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
     "/button/target_pose", 10,
     std::bind(&MTCTaskNode::centroidCallback, this, std::placeholders::_1)
@@ -58,12 +66,10 @@ void MTCTaskNode::subscribeToCentroidOnce() {
 }
 
 void MTCTaskNode::centroidCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
-  RCLCPP_INFO(LOGGER, "Target point for MoveTo stage: [%.3f, %.3f, %.3f, %.3f] Frame: %s", 
-                msg->pose.position.x, msg->pose.position.y, msg->pose.position.z, msg->pose.orientation.w, msg->header.frame_id.c_str());
+  RCLCPP_INFO(LOGGER, "Received new target pose: [%.3f, %.3f, %.3f] Frame: %s", 
+                msg->pose.position.x, msg->pose.position.y, msg->pose.position.z, msg->header.frame_id.c_str());
   last_centroid_ = *msg;
-  RCLCPP_INFO(LOGGER, "Target point for MoveTo stage: [%.3f, %.3f, %.3f, %.3f] Frame: %s", 
-                last_centroid_.pose.position.x, last_centroid_.pose.position.y, last_centroid_.pose.position.z, last_centroid_.pose.orientation.w, last_centroid_.header.frame_id.c_str());
-  centroid_sub_.reset();
+  new_pose_received_ = true;  // Signal that a new pose is available
 }
 
 
@@ -78,12 +84,38 @@ void MTCTaskNode::setupPlanningScene()
 
   geometry_msgs::msg::Pose pose;
   pose = last_centroid_.pose;
+  
+  // Flip 180° around X-axis to make object Z-axis point in the opposite direction
+  // 180° rotation around X has quaternion: (x=1, y=0, z=0, w=0)
+  // We multiply the incoming orientation by this rotation: q_new = q_original * q_flip
+  tf2::Quaternion q_original, q_flip, q_result;
+  tf2::fromMsg(pose.orientation, q_original);
+  q_flip.setRPY(M_PI, 0, 0);  // 180° around X-axis
+  q_result = q_original * q_flip;
+  q_result.normalize();
+  pose.orientation = tf2::toMsg(q_result);
+  
   object.pose = pose;
 
   moveit::planning_interface::PlanningSceneInterface psi;
   psi.applyCollisionObject(object);
   
-  RCLCPP_INFO(LOGGER, "Added collision object to planning scene");
+  RCLCPP_INFO(LOGGER, "Added collision object to planning scene (flipped 180° around X)");
+  
+  // Publish TF frame for the object to visualize its axes in RViz
+  geometry_msgs::msg::TransformStamped transform;
+  transform.header.stamp = node_->now();
+  transform.header.frame_id = "world";
+  transform.child_frame_id = "object_frame";
+  transform.transform.translation.x = pose.position.x;
+  transform.transform.translation.y = pose.position.y;
+  transform.transform.translation.z = pose.position.z;
+  transform.transform.rotation = pose.orientation;
+  
+  tf_broadcaster_->sendTransform(transform);
+  
+  RCLCPP_INFO(LOGGER, "Published TF frame 'object_frame' - enable TF display in RViz to see axes");
+  RCLCPP_INFO(LOGGER, "Object -Z axis now points in original Z direction (flipped)");
   
   // NOTE: Octomap collision allowances should be added to the SRDF file directly
   // Publishing an ACM via /planning_scene REPLACES the entire ACM, which would 
@@ -162,30 +194,16 @@ mtc::Task MTCTaskNode::createTask()
   cartesian_planner->setMaxAccelerationScalingFactor(1.0);
   cartesian_planner->setStepSize(0.002);  // Reduced from 0.01 to get more waypoints for short distances
 
-
-
   //add stages here 
 
-  /*
-  Stages to add:
-  Current State (Generator Stage) (current state)
-  Open Gripper (Propagator) (move to)
-  MoveToPush (Connector) 
-    Approach Button (Propagator Stage) (MoveRelative)
-    Allow COllision between object and gripper (Propagator) (ModifyPlanningScene)
-    Push Pose(Generator Stage) (GenerateGraspPose) (PoseStamped or Eigen Tranformation Matrix) (ComputeIK from object to gripper using the transform) (This stage determines how far the gripper will stop from the button. Basically this is the push)
-    [close gripper (Propagator Stage) (MoveTo)] {if not needed then ignore}
-    Pull Back (Propagator Stage) (MoveRelative)
-  */
-
   // Stage: Move arm to Home position
-  {
-    auto stage =
-        std::make_unique<mtc::stages::MoveTo>("Become Vertical", interpolation_planner);
-    stage->setGroup(arm_group_name);
-    stage->setGoal("Vertical");
-    task.add(std::move(stage));
-  }
+  // {
+  //   auto stage =
+  //       std::make_unique<mtc::stages::MoveTo>("Become Vertical", interpolation_planner);
+  //   stage->setGroup(arm_group_name);
+  //   stage->setGoal("Vertical");
+  //   task.add(std::move(stage));
+  // }
 
   // Stage: Close gripper for pushing (keep it closed throughout)
   {
@@ -243,8 +261,19 @@ mtc::Task MTCTaskNode::createTask()
     // Stage 2: Allow collision between gripper and button (before approach)
     {
       auto stage =
-          std::make_unique<mtc::stages::ModifyPlanningScene>("allow collision (hand,object)");
+          std::make_unique<mtc::stages::ModifyPlanningScene>("allow collision (gripper,object)");
       stage->allowCollisions("object",
+                             task.getRobotModel()
+                                 ->getJointModelGroup("gripper")
+                                 ->getLinkModelNamesWithCollisionGeometry(),
+                             true);
+      push_container->insert(std::move(stage));
+    }
+    // Stage 2: Allow collision between gripper and button (before approach)
+    {
+      auto stage =
+          std::make_unique<mtc::stages::ModifyPlanningScene>("allow collision (gripper,octomap)");
+      stage->allowCollisions("octomap",
                              task.getRobotModel()
                                  ->getJointModelGroup("gripper")
                                  ->getLinkModelNamesWithCollisionGeometry(),
@@ -258,7 +287,7 @@ mtc::Task MTCTaskNode::createTask()
       auto stage =
           std::make_unique<mtc::stages::MoveRelative>("approach", cartesian_planner);
       stage->properties().configureInitFrom(mtc::Stage::PARENT, { "group" });
-      stage->setMinMaxDistance(0.15, 0.20);  // Approach distance: 15-20cm
+      stage->setMinMaxDistance(0.01, 0.05);  // Approach distance: 1-5cm
       stage->setIKFrame(hand_frame);
       stage->properties().set("marker_ns", "approach");
 
@@ -293,7 +322,7 @@ mtc::Task MTCTaskNode::createTask()
       auto stage =
           std::make_unique<mtc::stages::MoveRelative>("Return to Verti", cartesian_planner);
       stage->properties().configureInitFrom(mtc::Stage::PARENT, { "group" });
-      stage->setMinMaxDistance(0.20, 0.30);  // Retract distance: 20-30cm (back to safe position)
+      stage->setMinMaxDistance(0.03, 0.05);  // Retract distance: 20-30cm (back to safe position)
       stage->setIKFrame(hand_frame);
       stage->properties().set("marker_ns", "retract");
 
@@ -330,27 +359,40 @@ int main(int argc, char** argv)
     executor.remove_node(mtc_task_node->getNodeBaseInterface());
   });
   
-  RCLCPP_INFO(LOGGER, "Waiting for centroid message...");
-  while (rclcpp::ok() && mtc_task_node->last_centroid_.header.frame_id.empty()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
-  mtc_task_node->setupPlanningScene();
-  try {
-    RCLCPP_INFO(LOGGER, "Calling doTask()...");
+  // Main loop: continuously wait for new poses and execute tasks
+  while (rclcpp::ok()) {
+    RCLCPP_INFO(LOGGER, "Waiting for /button/target_pose message...");
     
-    mtc_task_node->doTask();
-  }
-  catch (const mtc::InitStageException& e) {
-    RCLCPP_ERROR(LOGGER, "=== DETAILED INIT STAGE EXCEPTION ===");
-    RCLCPP_ERROR(LOGGER, "What: %s", e.what());
-    RCLCPP_ERROR(LOGGER, "=====================================");
-  }
-  catch (const std::exception& e) {
-    RCLCPP_ERROR(LOGGER, "Caught exception: %s", e.what());
+    // Wait for a new pose to be received
+    while (rclcpp::ok() && !mtc_task_node->new_pose_received_) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
     
+    if (!rclcpp::ok()) break;
+    
+    // Reset the flag immediately so we can detect the next new pose
+    mtc_task_node->new_pose_received_ = false;
+    
+    RCLCPP_INFO(LOGGER, "New target pose received, executing task...");
+    
+    try {
+      mtc_task_node->setupPlanningScene();
+      mtc_task_node->doTask();
+      RCLCPP_INFO(LOGGER, "Task completed! Ready for next target pose.");
+    }
+    catch (const mtc::InitStageException& e) {
+      RCLCPP_ERROR(LOGGER, "=== INIT STAGE EXCEPTION ===");
+      RCLCPP_ERROR(LOGGER, "What: %s", e.what());
+      RCLCPP_ERROR(LOGGER, "Task failed, ready for next target pose.");
+    }
+    catch (const std::exception& e) {
+      RCLCPP_ERROR(LOGGER, "Exception: %s", e.what());
+      RCLCPP_ERROR(LOGGER, "Task failed, ready for next target pose.");
+    }
   }
 
-  RCLCPP_INFO(LOGGER, "Waiting for spin thread to join...");
+  RCLCPP_INFO(LOGGER, "Shutting down...");
+  executor.cancel();
   spin_thread->join();
   rclcpp::shutdown();
   RCLCPP_INFO(LOGGER, "MTC Task Node shutdown complete.");
