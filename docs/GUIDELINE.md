@@ -72,7 +72,6 @@ This will clone the following packages:
 ### Step 3: Update Existing Repositories (Optional)
 
 ```bash
-# Pull latest changes for all repositories
 vcs pull src
 ```
 
@@ -119,13 +118,6 @@ colcon build --packages-up-to custom_plan
 
 # Parallel build with limited jobs (useful for memory-constrained systems)
 colcon build --parallel-workers 4
-
-# Build with debug symbols
-colcon build --cmake-args -DCMAKE_BUILD_TYPE=Debug
-
-# Build in Release mode for better performance
-colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
-```
 
 ### Step 3: Source the Workspace
 
