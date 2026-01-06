@@ -284,7 +284,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        # Include launch files
+        # Include launch files. This creates a launch and config folder inside the install/ directory located at the root of your workspace and copy the .lauch and .yaml files to tha directory. When we source our workspace, this insall directory get exported to the linux environment and they can be found by other packages.
         (os.path.join('share', package_name, 'launch'), 
             glob('launch/*.py')),
         # Include config files
@@ -417,10 +417,8 @@ ros2 run my_package my_node --ros-args -p param_name:=value
 ```
 
 ### 6. Useful Commands
-
+Refer to ROS 2 Documentation for details: https://docs.ros.org/en/humble/Tutorials/Beginner-CLI-Tools.html
 ```bash
-# List all packages in workspace
-colcon list
 
 # Check package dependencies
 ros2 pkg xml my_package --tag depend
@@ -447,12 +445,6 @@ ros2 service call /my_service std_srvs/srv/Trigger
 rosdep install --from-paths src --ignore-src -r -y
 ```
 
-**2. Build Failures**
-```bash
-# Check for specific package errors
-colcon build --packages-select problematic_package --event-handlers console_direct+
-```
-
 **3. Source Not Found**
 ```bash
 # Ensure workspace is sourced after building
@@ -470,7 +462,6 @@ vcs import src < src/moveit2_custom_plans/moveit2.repos --debug
 # Limit parallel jobs
 colcon build --parallel-workers 2 --executor sequential
 ```
-
 ---
 
 ## Quick Reference Card
@@ -497,6 +488,7 @@ When adding new packages or modifying existing ones:
 5. Document your nodes and their parameters
 
 ---
-
 *Last updated: January 2026*
+
+
 
